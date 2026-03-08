@@ -22,17 +22,11 @@ function safeJsonParse(str) {
   }
 }
 
-function getNested(obj, path, fallback = undefined) {
-  try {
-    return path.split('.').reduce((acc, key) => acc?.[key], obj) ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 async function forwardToWoll(rawBody, headers) {
   const url = process.env.WOLL_WEBHOOK_URL;
-  if (!url) return { ok: false, skipped: true, reason: 'WOLL_WEBHOOK_URL ausente' };
+  if (!url) {
+    return { ok: false, skipped: true, reason: 'WOLL_WEBHOOK_URL ausente' };
+  }
 
   const outHeaders = {
     'content-type': headers['content-type'] || 'application/json',
@@ -53,6 +47,8 @@ async function forwardToWoll(rawBody, headers) {
   });
 
   const text = await resp.text();
+  console.log('Resposta Woll:', resp.status, text.slice(0, 500));
+
   return { ok: resp.ok, status: resp.status, body: text.slice(0, 500) };
 }
 
@@ -107,118 +103,59 @@ function extractMessageInfo(payload) {
   return null;
 }
 
-async function kommoRequest(path, method = 'GET', body = null) {
-  const rawSubdomain = process.env.KOMMO_SUBDOMAIN;
-  const token = process.env.KOMMO_LONG_LIVED_TOKEN;
+async function sendToDatacrazy(info) {
+  const url = process.env.DATACRAZY_WEBHOOK_URL;
 
-  if (!rawSubdomain || !token) {
-    throw new Error('Kommo não configurado');
+  if (!url) {
+    throw new Error('DATACRAZY_WEBHOOK_URL ausente');
   }
 
-  const subdomain = rawSubdomain
-    .replace(/^https?:\/\//, '')
-    .replace(/\/.*$/, '')
-    .replace('.kommo.com', '')
-    .trim();
+  const ddi = info.phone?.startsWith('55') ? '55' : '';
+  const telefone = ddi ? info.phone.slice(2) : info.phone;
 
-  const url = `https://${subdomain}.kommo.com${path}`;
+  const payload = {
+    nome: info.name || 'Sem nome',
+    telefone: telefone || '',
+    ddi: ddi || '',
+    telefone_completo: info.phone ? `+${info.phone}` : '',
+    mensagem: info.text || '',
+    origem: 'WhatsApp',
+    tipo: info.kind || 'message',
+    wa_message_id: info.waMessageId || '',
+    timestamp: info.timestamp || '',
+    empresa: '',
+    email: '',
+    tags: ['whatsapp', 'woll', 'meta'],
+  };
 
-  let lastError;
+  console.log('Enviando para Datacrazy:', JSON.stringify(payload));
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const resp = await fetch(url, {
-        method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': 'Vercel-WhatsApp-Proxy/1.0',
-          Connection: 'close',
-        },
-        body: body ? JSON.stringify(body) : undefined,
-      });
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
 
-      const text = await resp.text();
-      const data = safeJsonParse(text) || text;
+  const text = await resp.text();
+  console.log('Resposta Datacrazy:', resp.status, text);
 
-      console.log(`Kommo ${method} ${url} -> ${resp.status}`);
-
-      if (!resp.ok) {
-        throw new Error(
-          `Kommo ${method} ${path} falhou: ${resp.status} ${
-            typeof data === 'string' ? data : JSON.stringify(data)
-          }`
-        );
-      }
-
-      return data;
-    } catch (err) {
-      lastError = err;
-      console.error(`Tentativa ${attempt} no Kommo falhou:`, err);
-
-      if (attempt < 3) {
-        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
-      }
-    }
+  if (!resp.ok) {
+    throw new Error(`Datacrazy falhou: ${resp.status} ${text}`);
   }
 
-  throw lastError;
-}
-
-async function findOrCreateContact(name, phone) {
-  const query = encodeURIComponent(phone);
-  const search = await kommoRequest(`/api/v4/contacts?query=${query}`);
-  const existing = search?._embedded?.contacts?.[0];
-  if (existing?.id) return existing.id;
-
-  const created = await kommoRequest('/api/v4/contacts', 'POST', [
-    {
-      name,
-      custom_fields_values: [
-        {
-          field_code: 'PHONE',
-          values: [{ value: `+${phone}` }],
-        },
-      ],
-    },
-  ]);
-
-  return created?._embedded?.contacts?.[0]?.id;
-}
-
-async function createLead(contactId, name) {
-  const pipelineId = process.env.KOMMO_PIPELINE_ID ? Number(process.env.KOMMO_PIPELINE_ID) : undefined;
-  const statusId = process.env.KOMMO_STATUS_ID ? Number(process.env.KOMMO_STATUS_ID) : undefined;
-
-  const payload = [{
-    name: `WhatsApp - ${name}`,
-    pipeline_id: pipelineId,
-    status_id: statusId,
-    _embedded: {
-      contacts: [{ id: contactId }],
-    },
-  }];
-
-  if (!pipelineId) delete payload[0].pipeline_id;
-  if (!statusId) delete payload[0].status_id;
-
-  const created = await kommoRequest('/api/v4/leads', 'POST', payload);
-  return created?._embedded?.leads?.[0]?.id;
-}
-
-async function addNoteToLead(leadId, text) {
-  await kommoRequest(`/api/v4/leads/${leadId}/notes`, 'POST', [
-    {
-      note_type: 'common',
-      params: { text },
-    },
-  ]);
+  return text;
 }
 
 function verifyMetaSignature(rawBody, signature, appSecret) {
   if (!signature || !appSecret) return true;
-  const expected = 'sha256=' + crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
+
+  const expected =
+    'sha256=' +
+    crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
+
   try {
     return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
   } catch {
@@ -235,6 +172,7 @@ export default async function handler(req, res) {
     if (mode === 'subscribe' && token === process.env.META_VERIFY_TOKEN) {
       return res.status(200).send(challenge);
     }
+
     return res.status(403).send('Forbidden');
   }
 
@@ -252,6 +190,7 @@ export default async function handler(req, res) {
 
   const signature = req.headers['x-hub-signature-256'];
   const appSecret = process.env.META_APP_SECRET || '';
+
   if (!verifyMetaSignature(rawBody, signature, appSecret)) {
     return res.status(401).json({ error: 'Assinatura inválida' });
   }
@@ -268,21 +207,8 @@ export default async function handler(req, res) {
     const info = extractMessageInfo(payload);
     if (!info) return;
 
-    const contactId = await findOrCreateContact(info.name, info.phone);
-    const leadId = await createLead(contactId, info.name);
-
-    const note = [
-      `Origem: WhatsApp`,
-      `Tipo: ${info.kind}`,
-      `Nome: ${info.name}`,
-      `Telefone: +${info.phone}`,
-      `Mensagem: ${info.text}`,
-      info.waMessageId ? `WA ID: ${info.waMessageId}` : null,
-      info.timestamp ? `Timestamp: ${info.timestamp}` : null,
-    ].filter(Boolean).join('\n');
-
-    await addNoteToLead(leadId, note);
+    await sendToDatacrazy(info);
   } catch (err) {
-    console.error('Erro ao salvar no Kommo:', err);
+    console.error('Erro ao enviar para o Datacrazy:', err);
   }
 }
