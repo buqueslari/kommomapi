@@ -108,31 +108,62 @@ function extractMessageInfo(payload) {
 }
 
 async function kommoRequest(path, method = 'GET', body = null) {
-  const subdomain = process.env.KOMMO_SUBDOMAIN;
+  const rawSubdomain = process.env.KOMMO_SUBDOMAIN;
   const token = process.env.KOMMO_LONG_LIVED_TOKEN;
 
-  if (!subdomain || !token) {
+  if (!rawSubdomain || !token) {
     throw new Error('Kommo não configurado');
   }
 
-  const resp = await fetch(`https://${subdomain}.kommo.com${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const subdomain = rawSubdomain
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*$/, '')
+    .replace('.kommo.com', '')
+    .trim();
 
-  const text = await resp.text();
-  const data = safeJsonParse(text) || text;
+  const url = `https://${subdomain}.kommo.com${path}`;
 
-  if (!resp.ok) {
-    throw new Error(`Kommo ${method} ${path} falhou: ${resp.status} ${typeof data === 'string' ? data : JSON.stringify(data)}`);
+  let lastError;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'Vercel-WhatsApp-Proxy/1.0',
+          Connection: 'close',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      const text = await resp.text();
+      const data = safeJsonParse(text) || text;
+
+      console.log(`Kommo ${method} ${url} -> ${resp.status}`);
+
+      if (!resp.ok) {
+        throw new Error(
+          `Kommo ${method} ${path} falhou: ${resp.status} ${
+            typeof data === 'string' ? data : JSON.stringify(data)
+          }`
+        );
+      }
+
+      return data;
+    } catch (err) {
+      lastError = err;
+      console.error(`Tentativa ${attempt} no Kommo falhou:`, err);
+
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      }
+    }
   }
 
-  return data;
+  throw lastError;
 }
 
 async function findOrCreateContact(name, phone) {
