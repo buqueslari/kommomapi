@@ -164,6 +164,7 @@ function verifyMetaSignature(rawBody, signature, appSecret) {
 }
 
 export default async function handler(req, res) {
+  console.log('DATACRAZY_VERSAO_NOVA');
   if (req.method === 'GET') {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
